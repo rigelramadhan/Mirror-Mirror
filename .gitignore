@@ -1,0 +1,23 @@
+# PyInstaller build artifacts
+build/
+dist/
+*.spec
+
+# Inno Setup output
+Output/
+
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+venv/
+
+# Editor/OS junk
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Local test artifacts
+*.log

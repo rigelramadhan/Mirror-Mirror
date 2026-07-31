@@ -4,6 +4,8 @@ Mirror your PC screen to your phone over your local network, with audio and basi
 
 Built this because Chrome Remote Desktop is discontinued, RDP shadowing doesn't work on Windows 10/11 Pro out of the box, and every third-party remote desktop app wants an account and a subscription for something that should just work on your own Wi-Fi.
 
+Considering an optional paid tier for remote access, [vote here](https://github.com/maco30001/Mirror-Mirror/discussions/2) if you'd use it.
+
 ## Install
 
 Grab the latest installer from [Releases](../../releases), run it, done. No admin rights needed, it installs to your user folder and adds a Start Menu entry.

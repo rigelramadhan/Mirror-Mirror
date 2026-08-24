@@ -10,9 +10,13 @@ from flask_socketio import SocketIO, emit, join_room
 app = Flask(__name__)
 socketio = SocketIO(app, async_mode="threading")
 
+APP_VERSION = "1.1.1"
+UPDATE_REPO = "maco30001/Mirror-Mirror"
+
 sessions = {}
 PAIRING_TTL = 300
 DISCONNECT_GRACE = 45
+VIEWER_RECONNECT_GRACE = 6 * 60 * 60
 
 MAX_ATTEMPTS_PER_WINDOW = 10
 ATTEMPT_WINDOW_SECONDS = 60
@@ -213,10 +217,6 @@ let sessionCode = null;
 let sessionToken = null;
 let role = null;
 
-// Feature-detect screen capture support rather than guessing by device type --
-// this is what actually determines whether Share Screen can work at all.
-// Mobile browsers generally lack this entirely; showing the button there
-// just leads to a confusing raw error the moment it's tapped.
 if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
   shareBtn.style.display = 'none';
 }
@@ -241,20 +241,34 @@ function closeMenu() {
 }
 
 async function newPC() {
-  const conn = new RTCPeerConnection({ iceServers: [{ urls: 'stun:stun.l.google.com:19302' }] });
+  const conn = new RTCPeerConnection({
+    iceServers: [
+      { urls: 'stun:stun.l.google.com:19302' },
+      { urls: 'stun:stun1.l.google.com:19302' }
+    ],
+    iceCandidatePoolSize: 4
+  });
   conn.onicecandidate = (e) => {
     if (e.candidate) socket.emit('ice_candidate', { candidate: e.candidate, room: sessionCode, token: sessionToken });
   };
   conn.oniceconnectionstatechange = () => log('ICE: ' + conn.iceConnectionState);
-  conn.onconnectionstatechange = () => log('Connection: ' + conn.connectionState);
+  conn.onconnectionstatechange = () => {
+    log('Connection: ' + conn.connectionState);
+    if (conn.connectionState === 'connected' && role === 'sharer') {
+      conn.getSenders().forEach(boostBitrate);
+    }
+  };
   return conn;
 }
 
 async function boostBitrate(sender) {
+  if (!sender.track || sender.track.kind !== 'video') return;
   try {
     const params = sender.getParameters();
     if (!params.encodings) params.encodings = [{}];
-    params.encodings[0].maxBitrate = 8_000_000;
+    params.encodings[0].maxBitrate = 12_000_000;
+    params.encodings[0].scaleResolutionDownBy = 1;
+    params.degradationPreference = 'maintain-framerate';
     await sender.setParameters(params);
   } catch (e) {}
 }
@@ -270,12 +284,13 @@ async function startSharing() {
     role = 'sharer';
     log('Requesting screen capture...', '#ff0');
     localStream = await navigator.mediaDevices.getDisplayMedia({
-      video: { width: 1920, height: 1080, frameRate: 30 },
+      video: { width: 1920, height: 1080, frameRate: { ideal: 30, max: 60 } },
       audio: { echoCancellation: false, noiseSuppression: false, autoGainControl: false }
     });
+    localStream.getVideoTracks()[0].contentHint = 'motion';
     shareBtn.disabled = true; viewBtn.disabled = true; disconnectBtn.disabled = false;
     pc = await newPC();
-    localStream.getTracks().forEach(track => boostBitrate(pc.addTrack(track, localStream)));
+    localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
     localStream.getVideoTracks()[0].onended = disconnect;
     socket.emit('host_create_session');
   } catch (e) {
@@ -299,7 +314,7 @@ async function viewScreen() {
     role = 'viewer';
     shareBtn.disabled = true; viewBtn.disabled = true; disconnectBtn.disabled = false;
     pc = await newPC();
-    pc.ontrack = (event) => { video.srcObject = event.streams[0]; log('Streaming', '#0f0'); };
+    pc.ontrack = (event) => { video.srcObject = event.streams[0]; video.play().catch(() => {}); log('Streaming', '#0f0'); };
     socket.emit('viewer_join_session', { code });
     setupTouchpad();
   } catch (e) {
@@ -308,10 +323,6 @@ async function viewScreen() {
   }
 }
 
-// Remembered devices: if this browser has paired successfully before, try
-// Remembered devices: shown as a visible list the user taps, not attempted
-// automatically. Only ever holds one entry per host, since each host is a
-// different IP/origin and browser storage is scoped per-origin already.
 function renderRememberedDevice() {
   const saved = localStorage.getItem('mirrorMirrorDevice');
   if (!saved) {
@@ -330,7 +341,7 @@ async function reconnectToDevice() {
   role = 'viewer';
   log('Reconnecting...', '#ff0');
   pc = await newPC();
-  pc.ontrack = (event) => { video.srcObject = event.streams[0]; log('Streaming', '#0f0'); };
+  pc.ontrack = (event) => { video.srcObject = event.streams[0]; video.play().catch(() => {}); log('Streaming', '#0f0'); };
   setupTouchpad();
   socket.emit('quick_reconnect', { device_token: info.token });
 }
@@ -352,6 +363,9 @@ socket.on('quick_reconnect_unavailable', () => {
 });
 
 function disconnect() {
+  if (sessionCode && sessionToken && role) {
+    socket.emit('leave_session', { room: sessionCode, token: sessionToken, role: role === 'sharer' ? 'host' : 'viewer' });
+  }
   if (pc) { pc.close(); pc = null; }
   if (localStream) { localStream.getTracks().forEach(t => t.stop()); localStream = null; }
   video.srcObject = null;
@@ -397,21 +411,28 @@ socket.on('peer_joined', async (data) => {
   if (role === 'sharer' && data.role === 'viewer') {
     log('Viewer joined, connecting...', '#0f0');
     closeMenu();
+    if (!pc || pc.connectionState === 'closed') {
+      pc = await newPC();
+      localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+    }
     await createAndSendOffer();
   }
 });
 socket.on('peer_left', () => { log('Other side disconnected', '#f00'); disconnect(); });
 
+socket.on('viewer_disconnected', () => {
+  if (role !== 'sharer') return;
+  if (pc) { pc.close(); pc = null; }
+  log('Viewer disconnected -- waiting to reconnect...', '#ff0');
+});
+
 socket.on('rejoined', () => { log('Reconnected -- restoring video...', '#ff0'); });
 
-// Host side: server tells us to renegotiate after either party reconnects.
-// The old RTCPeerConnection is likely dead after a background suspension,
-// so we discard it and start clean rather than trying to salvage it.
 socket.on('please_reoffer', async () => {
   if (role !== 'sharer' || !localStream) return;
   if (pc) { pc.close(); pc = null; }
   pc = await newPC();
-  localStream.getTracks().forEach(track => boostBitrate(pc.addTrack(track, localStream)));
+  localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
   await createAndSendOffer();
 });
 
@@ -420,7 +441,7 @@ socket.on('offer', async (data) => {
   try {
     if (pc) { pc.close(); }
     pc = await newPC();
-    pc.ontrack = (event) => { video.srcObject = event.streams[0]; log('Streaming', '#0f0'); };
+    pc.ontrack = (event) => { video.srcObject = event.streams[0]; video.play().catch(() => {}); log('Streaming', '#0f0'); };
     await pc.setRemoteDescription(new RTCSessionDescription(data));
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
@@ -589,6 +610,7 @@ def _complete_pairing(code, s, sid, existing_device_token=None):
         trusted_devices[device_token] = {'added_at': time.time()}
         _save_trusted_devices()
 
+    s['device_token'] = device_token
     emit('session_joined', {'code': code, 'token': s['token'], 'device_token': device_token})
     emit('peer_joined', {'role': 'viewer'}, room=s['host_sid'])
 
@@ -618,6 +640,12 @@ def handle_quick_reconnect(data):
     if not device_token or device_token not in trusted_devices:
         emit('quick_reconnect_unavailable')
         return
+
+    for code, s in sessions.items():
+        if s.get('device_token') == device_token and s.get('host_sid'):
+            _complete_pairing(code, s, request.sid, existing_device_token=device_token)
+            return
+
     waiting_code = None
     for code, s in sessions.items():
         if not s['claimed'] and s.get('host_sid'):
@@ -627,6 +655,26 @@ def handle_quick_reconnect(data):
         emit('quick_reconnect_unavailable')
         return
     _complete_pairing(waiting_code, sessions[waiting_code], request.sid, existing_device_token=device_token)
+
+
+@socketio.on('leave_session')
+def handle_leave_session(data):
+    code, token, role = data.get('room'), data.get('token'), data.get('role')
+    s = sessions.get(code)
+    if not s or s.get('token') != token:
+        return
+    if role == 'host' and s.get('host_sid') == request.sid:
+        if s.get('viewer_sid'):
+            emit('peer_left', room=s['viewer_sid'])
+        sessions.pop(code, None)
+        tray_status["code"] = None
+        tray_status["connected"] = False
+    elif role == 'viewer' and s.get('viewer_sid') == request.sid:
+        s['viewer_sid'] = None
+        s['viewer_disconnected_at'] = time.time()
+        tray_status["connected"] = False
+        if s.get('host_sid'):
+            emit('viewer_disconnected', room=s['host_sid'])
 
 
 @socketio.on('forget_device')
@@ -648,6 +696,8 @@ def handle_disconnect():
             s['viewer_sid'] = None
             s['viewer_disconnected_at'] = time.time()
             tray_status["connected"] = False
+            if s.get('host_sid'):
+                emit('viewer_disconnected', room=s['host_sid'])
 
 
 @socketio.on('rejoin_session')
@@ -676,9 +726,21 @@ def _sweep_expired_sessions():
         now = time.time()
         for code, s in list(sessions.items()):
             host_gone = s['host_sid'] is None and now - s.get('host_disconnected_at', now) > DISCONNECT_GRACE
-            viewer_gone = s['viewer_sid'] is None and s['claimed'] and now - s.get('viewer_disconnected_at', now) > DISCONNECT_GRACE
-            if host_gone or viewer_gone:
-                socketio.emit('peer_left', room=code, namespace='/')
+            if host_gone:
+                if s.get('viewer_sid'):
+                    socketio.emit('peer_left', room=s['viewer_sid'], namespace='/')
+                del sessions[code]
+                tray_status["code"] = None
+                tray_status["connected"] = False
+                continue
+
+            viewer_gone = (
+                s['viewer_sid'] is None and s['claimed']
+                and now - s.get('viewer_disconnected_at', now) > VIEWER_RECONNECT_GRACE
+            )
+            if viewer_gone:
+                if s.get('host_sid'):
+                    socketio.emit('peer_left', room=s['host_sid'], namespace='/')
                 del sessions[code]
                 tray_status["code"] = None
                 tray_status["connected"] = False
@@ -764,6 +826,49 @@ if __name__ == '__main__':
     def run_server():
         socketio.run(app, host='0.0.0.0', port=5000, debug=False, use_reloader=False, allow_unsafe_werkzeug=True)
 
+    UPDATE_CHECK_INTERVAL = 6 * 60 * 60
+    update_status = {"available": False, "version": None, "url": f"https://github.com/{UPDATE_REPO}/releases/latest"}
+
+    def _parse_version(v):
+        v = (v or "").strip().lstrip("vV")
+        try:
+            return tuple(int(p) for p in v.split("."))
+        except ValueError:
+            return None
+
+    def _check_for_update():
+        import urllib.request
+        try:
+            req = urllib.request.Request(
+                f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest",
+                headers={"Accept": "application/vnd.github+json", "User-Agent": "MirrorMirror-UpdateCheck"},
+            )
+            with urllib.request.urlopen(req, timeout=10) as resp:
+                data = json.load(resp)
+            latest_tag = data.get("tag_name", "")
+            latest = _parse_version(latest_tag)
+            current = _parse_version(APP_VERSION)
+            if not latest or not current or latest <= current:
+                return
+            already_notified = update_status["available"] and update_status["version"] == latest_tag
+            update_status["available"] = True
+            update_status["version"] = latest_tag
+            update_status["url"] = data.get("html_url") or update_status["url"]
+            if not already_notified:
+                tray_icon.notify(
+                    f"Version {latest_tag} is available (you're on {APP_VERSION}). "
+                    "Click the tray icon to download it.",
+                    "Mirror Mirror update available",
+                )
+        except Exception as e:
+            print(f"[warn] update check failed: {e}")
+
+    def _update_check_loop():
+        time.sleep(5)
+        while True:
+            _check_for_update()
+            time.sleep(UPDATE_CHECK_INTERVAL)
+
     def status_label(item):
         if tray_status["connected"]:
             return "Status: Connected"
@@ -785,6 +890,15 @@ if __name__ == '__main__':
     def open_app(icon, item):
         webbrowser.open("http://localhost:5000")
 
+    def update_label(item):
+        if update_status["available"]:
+            return f"Update available: {update_status['version']} (click)"
+        return f"Version {APP_VERSION}"
+
+    def open_update(icon, item):
+        if update_status["available"]:
+            webbrowser.open(update_status["url"])
+
     def quit_app(icon, item):
         icon.stop()
         import os
@@ -794,6 +908,7 @@ if __name__ == '__main__':
     menu = pystray.Menu(
         pystray.MenuItem(status_label, None, enabled=False),
         pystray.MenuItem(address_label, copy_address),
+        pystray.MenuItem(update_label, open_update),
         pystray.MenuItem("Open Mirror Mirror", open_app, default=True),
         pystray.MenuItem("Quit", quit_app),
     )
@@ -816,4 +931,5 @@ if __name__ == '__main__':
 
     socketio.start_background_task(_sweep_expired_sessions)
     threading.Thread(target=run_server, daemon=True).start()
+    threading.Thread(target=_update_check_loop, daemon=True).start()
     tray_icon.run()

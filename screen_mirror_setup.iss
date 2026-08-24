@@ -3,7 +3,7 @@
 ; Requires dist\ScreenMirror.exe to already exist -- run PyInstaller first.
 
 #define MyAppName "Mirror Mirror"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.1.1"
 #define MyAppExeName "MirrorMirror.exe"
 
 [Setup]

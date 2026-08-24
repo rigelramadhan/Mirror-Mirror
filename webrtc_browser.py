@@ -805,10 +805,16 @@ def handle_mouse_scroll(data):
 if __name__ == '__main__':
     import io
     import socket
+    import sys
     import threading
     import webbrowser
     import pystray
     from PIL import Image
+
+    if sys.stdout is None:
+        sys.stdout = open(os.devnull, 'w')
+    if sys.stderr is None:
+        sys.stderr = open(os.devnull, 'w')
 
     def get_lan_ip():
         s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
@@ -914,22 +920,24 @@ if __name__ == '__main__':
     )
     tray_icon = pystray.Icon("MirrorMirror", icon_image, "Mirror Mirror", menu)
 
-    try:
-        import tkinter as tk
-        from tkinter import messagebox
-        _root = tk.Tk()
-        _root.withdraw()
-        messagebox.showinfo(
-            "Mirror Mirror",
-            "Mirror Mirror is now running in the system tray.\n\n"
-            "Right-click the tray icon to see your pairing code or address, "
-            "or left-click to open the app."
-        )
-        _root.destroy()
-    except Exception:
-        pass
+    def _show_welcome_popup():
+        try:
+            import tkinter as tk
+            from tkinter import messagebox
+            _root = tk.Tk()
+            _root.withdraw()
+            messagebox.showinfo(
+                "Mirror Mirror",
+                "Mirror Mirror is now running in the system tray.\n\n"
+                "Right-click the tray icon to see your pairing code or address, "
+                "or left-click to open the app."
+            )
+            _root.destroy()
+        except Exception:
+            pass
 
     socketio.start_background_task(_sweep_expired_sessions)
     threading.Thread(target=run_server, daemon=True).start()
     threading.Thread(target=_update_check_loop, daemon=True).start()
+    threading.Thread(target=_show_welcome_popup, daemon=True).start()
     tray_icon.run()

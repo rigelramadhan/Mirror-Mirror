@@ -10,7 +10,7 @@ from flask_socketio import SocketIO, emit, join_room
 app = Flask(__name__)
 socketio = SocketIO(app, async_mode="threading")
 
-APP_VERSION = "1.1.1"
+APP_VERSION = "1.1.2"
 UPDATE_REPO = "maco30001/Mirror-Mirror"
 
 sessions = {}
@@ -216,6 +216,8 @@ let localStream = null;
 let sessionCode = null;
 let sessionToken = null;
 let role = null;
+let iceRecoveryTimer = null;
+let reofferInProgress = false;
 
 if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
   shareBtn.style.display = 'none';
@@ -251,7 +253,22 @@ async function newPC() {
   conn.onicecandidate = (e) => {
     if (e.candidate) socket.emit('ice_candidate', { candidate: e.candidate, room: sessionCode, token: sessionToken });
   };
-  conn.oniceconnectionstatechange = () => log('ICE: ' + conn.iceConnectionState);
+  conn.oniceconnectionstatechange = () => {
+    log('ICE: ' + conn.iceConnectionState);
+    const state = conn.iceConnectionState;
+    if (state === 'connected' || state === 'completed') {
+      if (iceRecoveryTimer) { clearTimeout(iceRecoveryTimer); iceRecoveryTimer = null; }
+      return;
+    }
+    if (state !== 'disconnected' && state !== 'failed') return;
+    if (iceRecoveryTimer || role !== 'sharer') return;
+    const delay = state === 'failed' ? 1000 : 5000;
+    iceRecoveryTimer = setTimeout(() => {
+      iceRecoveryTimer = null;
+      if (conn !== pc) return;
+      reofferFromHost();
+    }, delay);
+  };
   conn.onconnectionstatechange = () => {
     log('Connection: ' + conn.connectionState);
     if (conn.connectionState === 'connected' && role === 'sharer') {
@@ -428,13 +445,20 @@ socket.on('viewer_disconnected', () => {
 
 socket.on('rejoined', () => { log('Reconnected -- restoring video...', '#ff0'); });
 
-socket.on('please_reoffer', async () => {
-  if (role !== 'sharer' || !localStream) return;
-  if (pc) { pc.close(); pc = null; }
-  pc = await newPC();
-  localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
-  await createAndSendOffer();
-});
+async function reofferFromHost() {
+  if (role !== 'sharer' || !localStream || reofferInProgress) return;
+  reofferInProgress = true;
+  try {
+    if (pc) { pc.close(); pc = null; }
+    pc = await newPC();
+    localStream.getTracks().forEach(track => pc.addTrack(track, localStream));
+    await createAndSendOffer();
+  } finally {
+    reofferInProgress = false;
+  }
+}
+
+socket.on('please_reoffer', () => { reofferFromHost(); });
 
 socket.on('offer', async (data) => {
   if (role !== 'viewer') return;
@@ -472,6 +496,16 @@ socket.on('connect', () => {
 });
 socket.on('disconnect', () => {
   log('Connection lost, retrying...', '#f00');
+});
+
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState !== 'visible' || role !== 'viewer' || !video.srcObject) return;
+  const stream = video.srcObject;
+  video.srcObject = null;
+  requestAnimationFrame(() => {
+    video.srcObject = stream;
+    video.play().catch(() => {});
+  });
 });
 
 const SENSITIVITY = 1.6;

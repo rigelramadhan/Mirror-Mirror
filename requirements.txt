@@ -1,6 +1,5 @@
-flask
-flask-socketio
-pyautogui
-pystray
-pillow
-pyperclip
+-r requirements-core.txt
+pyautogui==0.9.54
+pystray==0.19.5
+pillow==13.0.0
+pyperclip==1.11.0

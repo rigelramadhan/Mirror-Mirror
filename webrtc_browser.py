@@ -5,15 +5,20 @@ import secrets
 import time
 from collections import defaultdict
 from flask import Flask, render_template_string, request, Response
-from flask_socketio import SocketIO, emit, join_room
+from flask_socketio import SocketIO, emit, join_room, leave_room
 
 app = Flask(__name__)
 socketio = SocketIO(app, async_mode="threading")
 
 APP_VERSION = "1.1.2"
-UPDATE_REPO = "maco30001/Mirror-Mirror"
+UPDATE_REPO = "rigelramadhan/Mirror-Mirror"
 
 sessions = {}
+# Never send this capability to LAN viewers. It authorizes local host sockets,
+# independently of the credentials issued to a paired viewer.
+_host_capability = secrets.token_hex(32)
+_host_sids = set()
+_LOCAL_HOSTS = {'localhost:5000', '127.0.0.1:5000', '[::1]:5000'}
 PAIRING_TTL = 300
 DISCONNECT_GRACE = 45
 VIEWER_RECONNECT_GRACE = 6 * 60 * 60
@@ -21,6 +26,22 @@ VIEWER_RECONNECT_GRACE = 6 * 60 * 60
 MAX_ATTEMPTS_PER_WINDOW = 10
 ATTEMPT_WINDOW_SECONDS = 60
 _failed_attempts = defaultdict(list)
+
+
+def _local_host_request():
+    # Check the peer address, not spoofable Forwarded/X-Forwarded-For headers.
+    # Literal Host names also prevent DNS rebinding from exposing the capability.
+    return (request.remote_addr in {'127.0.0.1', '::1'}
+            and request.host.lower() in _LOCAL_HOSTS)
+
+
+@socketio.on('connect')
+def handle_connect(auth=None):
+    auth = auth if isinstance(auth, dict) else {}
+    capability = auth.get('host_capability')
+    if (_local_host_request() and isinstance(capability, str)
+            and secrets.compare_digest(capability, _host_capability)):
+        _host_sids.add(request.sid)
 
 _data_dir = os.path.join(os.environ.get('LOCALAPPDATA', os.path.expanduser('~')), 'MirrorMirror')
 os.makedirs(_data_dir, exist_ok=True)
@@ -84,11 +105,15 @@ def _session_for(code):
 
 def _authorized(code, token, sid, role):
     s = sessions.get(code)
-    if not s or s.get('token') != token:
+    if not s:
         return False
     if role == 'host':
-        return s.get('host_sid') == sid
-    return s.get('viewer_sid') == sid
+        return (sid in _host_sids and s.get('host_sid') == sid
+                and s.get('host_token') == token)
+    if role == 'viewer':
+        return (s.get('host_sid') in _host_sids and s.get('claimed')
+                and s.get('viewer_sid') == sid and s.get('token') == token)
+    return False
 
 
 ICON_B64 = "iVBORw0KGgoAAAANSUhEUgAAAMAAAADACAIAAADdvvtQAAAClUlEQVR4nO3d0U3jQBRA0c2KBlwDRVIDRVIDLfCBxMdqv7jzJkM4pwAb5d2M7cFSbtd1/YHv+nvvP4CfTUAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiI5GnDOd5f3jachf+6Xp9Hj38b/clL6RxiLqPBS5h6zjE3i6mA1HOaoYmMBKSeM03MZX1A6jnZ8ul4jCdZHJDl53xrZ7RjH+jT9IYE/9jzZd50CVPPfns+c/dAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIJJNAb2/vO05EV/2fOZPG87xSUMPafEKdL0+rz0gy62dkXsgkvUBWYROtnw6IyuQhs40MZepS5iGTjM0kcF7IA2dY24Wt+u6hg79xQP8HU1/jXcExAPzGE8iIBIBkQiIREAkAiLZ9zrHITZsSv2qHVQrEImASAREIiASAZEIiERAJAIiERDJg7xQ9kNfenyAPWsrEImASAREIiASAZEIiERAJAIiERCJgEge5F8Z3IsViERAJAIiERCJgEgERCIgEgGRCIhEQCQCIhEQiYBIBEQiIBIBkQiIREAkAiIREImASAREIiASAZEIiERAJAIiERCJgEgERCIgEgGRfADk8Dr46J8LAgAAAABJRU5ErkJggg=="
@@ -198,7 +223,8 @@ HTML = """
 
 <script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
 <script>
-const socket = io();
+const hostCapability = {{ host_capability|tojson }};
+const socket = io({ auth: { host_capability: hostCapability } });
 const video = document.getElementById('remoteVideo');
 const statusEl = document.getElementById('status');
 const shareBtn = document.getElementById('shareBtn');
@@ -219,7 +245,7 @@ let role = null;
 let iceRecoveryTimer = null;
 let reofferInProgress = false;
 
-if (!navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
+if (!hostCapability || !navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
   shareBtn.style.display = 'none';
 }
 
@@ -563,7 +589,12 @@ function onTouchEnd(e) {
 
 @app.route('/')
 def index():
-    return render_template_string(HTML)
+    response = app.make_response(render_template_string(
+        HTML, host_capability=_host_capability if _local_host_request() else None))
+    response.headers['Cache-Control'] = 'no-store'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['Content-Security-Policy'] = "frame-ancestors 'none'"
+    return response
 
 
 @app.route('/manifest.json')
@@ -592,35 +623,42 @@ tray_status = {"code": None, "connected": False}
 
 @socketio.on('host_create_session')
 def handle_host_create_session():
+    if request.sid not in _host_sids:
+        emit('pairing_error', {'message': 'Start sharing from http://localhost:5000 on the PC'})
+        return
     code = _new_code()
-    token = secrets.token_hex(16)
+    host_token = secrets.token_hex(32)
     sessions[code] = {
         'host_sid': request.sid,
         'viewer_sid': None,
-        'token': token,
+        'host_token': host_token,
+        'token': secrets.token_hex(32),
         'created_at': time.time(),
         'claimed': False,
     }
     join_room(code)
     tray_status["code"] = code
     tray_status["connected"] = False
-    emit('session_created', {'code': code, 'token': token})
+    emit('session_created', {'code': code, 'token': host_token})
 
 
 @socketio.on('refresh_code')
 def handle_refresh_code(data):
     old_code, token = data.get('room'), data.get('token')
     s = sessions.get(old_code)
-    if not s or s.get('token') != token or s.get('host_sid') != request.sid:
+    if not _authorized(old_code, token, request.sid, 'host'):
         return
     if s['claimed'] and s.get('viewer_sid'):
         emit('code_refreshed', room=s['viewer_sid'])
+        leave_room(old_code, sid=s['viewer_sid'])
+    leave_room(old_code)
     new_code = _new_code()
-    new_token = secrets.token_hex(16)
+    new_token = secrets.token_hex(32)
     sessions[new_code] = {
         'host_sid': request.sid,
         'viewer_sid': None,
-        'token': new_token,
+        'host_token': new_token,
+        'token': secrets.token_hex(32),
         'created_at': time.time(),
         'claimed': False,
     }
@@ -632,8 +670,12 @@ def handle_refresh_code(data):
 
 
 def _complete_pairing(code, s, sid, existing_device_token=None):
+    if s.get('host_sid') not in _host_sids or s.get('viewer_sid'):
+        emit('pairing_error', {'message': 'Host unavailable or viewer already connected'})
+        return
     s['claimed'] = True
     s['viewer_sid'] = sid
+    s['token'] = secrets.token_hex(32)
     join_room(code)
     tray_status["connected"] = True
 
@@ -676,13 +718,15 @@ def handle_quick_reconnect(data):
         return
 
     for code, s in sessions.items():
-        if s.get('device_token') == device_token and s.get('host_sid'):
+        if (s.get('device_token') == device_token
+                and s.get('host_sid') in _host_sids and not s.get('viewer_sid')):
             _complete_pairing(code, s, request.sid, existing_device_token=device_token)
             return
 
     waiting_code = None
-    for code, s in sessions.items():
-        if not s['claimed'] and s.get('host_sid'):
+    for code in list(sessions):
+        s = _session_for(code)
+        if s and not s['claimed'] and s.get('host_sid') in _host_sids:
             waiting_code = code
             break
     if not waiting_code:
@@ -695,15 +739,18 @@ def handle_quick_reconnect(data):
 def handle_leave_session(data):
     code, token, role = data.get('room'), data.get('token'), data.get('role')
     s = sessions.get(code)
-    if not s or s.get('token') != token:
+    if not _authorized(code, token, request.sid, role):
         return
     if role == 'host' and s.get('host_sid') == request.sid:
         if s.get('viewer_sid'):
             emit('peer_left', room=s['viewer_sid'])
+            leave_room(code, sid=s['viewer_sid'])
+        leave_room(code)
         sessions.pop(code, None)
         tray_status["code"] = None
         tray_status["connected"] = False
     elif role == 'viewer' and s.get('viewer_sid') == request.sid:
+        leave_room(code)
         s['viewer_sid'] = None
         s['viewer_disconnected_at'] = time.time()
         tray_status["connected"] = False
@@ -721,6 +768,7 @@ def handle_forget_device(data):
 
 @socketio.on('disconnect')
 def handle_disconnect():
+    _host_sids.discard(request.sid)
     for code, s in list(sessions.items()):
         if s['host_sid'] == request.sid:
             s['host_sid'] = None
@@ -738,7 +786,12 @@ def handle_disconnect():
 def handle_rejoin_session(data):
     code, token, role = data.get('code'), data.get('token'), data.get('role')
     s = sessions.get(code)
-    if not s or s.get('token') != token:
+    token_key = 'host_token' if role == 'host' else 'token'
+    if (not s or role not in {'host', 'viewer'} or s.get(token_key) != token
+            or (role == 'host' and request.sid not in _host_sids)
+            or (role == 'viewer' and (not s['claimed']
+                                     or s.get('host_sid') not in _host_sids))
+            or s.get(role + '_sid') not in (None, request.sid)):
         emit('pairing_error', {'message': 'Session expired, please reconnect'})
         return
     if role == 'host':
@@ -785,7 +838,10 @@ def handle_offer(data):
     code, token = data.get('room'), data.get('token')
     if not _authorized(code, token, request.sid, 'host'):
         return
-    emit('offer', data, room=code, include_self=False)
+    # Do not forward the host's credential to the viewer.
+    peer = sessions[code].get('viewer_sid')
+    if peer:
+        emit('offer', {'sdp': data.get('sdp'), 'type': data.get('type')}, room=peer)
 
 
 @socketio.on('answer')
@@ -793,16 +849,19 @@ def handle_answer(data):
     code, token = data.get('room'), data.get('token')
     if not _authorized(code, token, request.sid, 'viewer'):
         return
-    emit('answer', data, room=code, include_self=False)
+    emit('answer', {'sdp': data.get('sdp'), 'type': data.get('type')}, room=sessions[code]['host_sid'])
 
 
 @socketio.on('ice_candidate')
 def handle_ice_candidate(data):
     code, token = data.get('room'), data.get('token')
     s = sessions.get(code)
-    if not s or s.get('token') != token or request.sid not in (s.get('host_sid'), s.get('viewer_sid')):
+    is_host = _authorized(code, token, request.sid, 'host')
+    if not is_host and not _authorized(code, token, request.sid, 'viewer'):
         return
-    emit('ice_candidate', data, room=code, include_self=False)
+    peer = s.get('viewer_sid') if is_host else s.get('host_sid')
+    if peer:
+        emit('ice_candidate', {'candidate': data.get('candidate')}, room=peer)
 
 
 @socketio.on('mouse_move')

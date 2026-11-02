@@ -21,3 +21,5 @@ Thumbs.db
 
 # Local test artifacts
 *.log
+.pytest_cache/
+.test-temp/

@@ -1,31 +1,48 @@
 import base64
-import json
+import math
 import os
 import secrets
+import threading
 import time
 from collections import defaultdict
-from flask import Flask, render_template_string, request, Response
+from functools import wraps
+from flask import Flask, render_template_string, request, Response, abort
 from flask_socketio import SocketIO, emit, join_room, leave_room
 
 app = Flask(__name__)
-socketio = SocketIO(app, async_mode="threading")
+socketio = SocketIO(app, async_mode="threading", max_http_buffer_size=65536)
 
-APP_VERSION = "1.1.2"
-UPDATE_REPO = "rigelramadhan/Mirror-Mirror"
+APP_VERSION = "2.0.0"
 
 sessions = {}
 # Never send this capability to LAN viewers. It authorizes local host sockets,
 # independently of the credentials issued to a paired viewer.
 _host_capability = secrets.token_hex(32)
 _host_sids = set()
+_connected_sids = set()
+_session_lock = threading.RLock()
 _LOCAL_HOSTS = {'localhost:5000', '127.0.0.1:5000', '[::1]:5000'}
 PAIRING_TTL = 300
-DISCONNECT_GRACE = 45
-VIEWER_RECONNECT_GRACE = 6 * 60 * 60
+APPROVAL_TTL = 60
+SESSION_TTL = 60 * 60
+IDLE_TTL = 15 * 60
 
 MAX_ATTEMPTS_PER_WINDOW = 10
 ATTEMPT_WINDOW_SECONDS = 60
 _failed_attempts = defaultdict(list)
+
+
+def _locked(handler):
+    @wraps(handler)
+    def wrapped(*args):
+        # Malformed event payloads are ignored before reaching any handler.
+        if args and not isinstance(args[0], dict):
+            return
+        with _session_lock:
+            if not args and handler.__name__ != 'handle_host_create_session':
+                args = ({},)
+            return handler(*args)
+    return wrapped
 
 
 def _local_host_request():
@@ -37,49 +54,33 @@ def _local_host_request():
 
 @socketio.on('connect')
 def handle_connect(auth=None):
+    if not request.is_secure and not _local_host_request():
+        return False
     auth = auth if isinstance(auth, dict) else {}
     capability = auth.get('host_capability')
-    if (_local_host_request() and isinstance(capability, str)
-            and secrets.compare_digest(capability, _host_capability)):
-        _host_sids.add(request.sid)
+    with _session_lock:
+        _connected_sids.add(request.sid)
+        if (_local_host_request() and isinstance(capability, str)
+                and secrets.compare_digest(capability, _host_capability)):
+            _host_sids.add(request.sid)
 
 _data_dir = os.path.join(os.environ.get('LOCALAPPDATA', os.path.expanduser('~')), 'MirrorMirror')
 os.makedirs(_data_dir, exist_ok=True)
-TRUSTED_DEVICES_FILE = os.path.join(_data_dir, 'trusted_devices.json')
-
-
-def _load_trusted_devices():
-    try:
-        with open(TRUSTED_DEVICES_FILE, 'r') as f:
-            return json.load(f)
-    except Exception:
-        return {}
-
-
-def _save_trusted_devices():
-    try:
-        with open(TRUSTED_DEVICES_FILE, 'w') as f:
-            json.dump(trusted_devices, f)
-    except Exception as e:
-        print(f"[warn] couldn't save trusted devices: {e}")
-
-
-trusted_devices = _load_trusted_devices()
 
 
 def _rate_limited(ip):
-    now = time.time()
+    now = time.monotonic()
     recent = [t for t in _failed_attempts[ip] if now - t < ATTEMPT_WINDOW_SECONDS]
     _failed_attempts[ip] = recent
     return len(recent) >= MAX_ATTEMPTS_PER_WINDOW
 
 
 def _record_failed_attempt(ip):
-    _failed_attempts[ip].append(time.time())
+    _failed_attempts[ip].append(time.monotonic())
 
 try:
     import pyautogui
-    pyautogui.FAILSAFE = False
+    pyautogui.FAILSAFE = True
     HAVE_PYAUTOGUI = True
 except Exception:
     HAVE_PYAUTOGUI = False
@@ -94,17 +95,22 @@ def _new_code():
 
 
 def _session_for(code):
+    if not isinstance(code, str):
+        return None
     s = sessions.get(code)
     if not s:
         return None
-    if not s['claimed'] and time.time() - s['created_at'] > PAIRING_TTL:
-        del sessions[code]
+    now = time.monotonic()
+    if ((not s['claimed'] and now - s['created_at'] > PAIRING_TTL)
+            or (s['claimed'] and (now - s['approved_at'] > SESSION_TTL
+                                 or now - s['last_activity'] > IDLE_TTL))):
+        _end_session(code, 'Session expired; start sharing again')
         return None
     return s
 
 
 def _authorized(code, token, sid, role):
-    s = sessions.get(code)
+    s = _session_for(code)
     if not s:
         return False
     if role == 'host':
@@ -179,6 +185,7 @@ HTML = """
                display:flex; flex-direction:column; gap:10px;
                transition:right 0.25s ease; box-shadow:-4px 0 20px rgba(0,0,0,0.4); }
   #menuPanel.open { right:0; }
+  #menuPanel { overflow-y:auto; }
   #menuPanel button, #menuPanel input { width:100%; }
   button { background:#333; color:#fff; border:none; padding:10px 22px; border-radius:6px;
            cursor:pointer; font-size:14px; }
@@ -195,15 +202,24 @@ HTML = """
   <button id="menuToggle" onclick="toggleMenu()">&#9776;</button>
   <div id="menuBackdrop" onclick="toggleMenu()"></div>
   <div id="menuPanel">
-    <div id="rememberedList" style="display:none; flex-direction:column; gap:6px;">
-      <div style="font-size:11px; color:#888; text-transform:uppercase; letter-spacing:1px;">Previously connected</div>
-      <div class="card" style="background:#222; border:1px solid #444; border-radius:8px; padding:10px; display:flex; flex-direction:column; gap:6px;">
-        <div id="rememberedLabel" style="font-size:13px; color:#ccc;"></div>
-        <div style="display:flex; gap:8px;">
-          <button onclick="reconnectToDevice()" class="primary" style="flex:1; padding:8px; font-size:13px;">Reconnect</button>
-          <button onclick="forgetDevice()" style="padding:8px 12px; font-size:13px;">Forget</button>
-        </div>
-      </div>
+    {% if host_capability %}
+    <details style="color:#ddd;font-size:13px;line-height:1.5;overflow:auto;">
+      <summary>iPhone HTTPS setup</summary>
+      <p>Phone address: <strong>{{ lan_url }}</strong></p>
+      <p><a href="/setup/iphone-profile" style="color:#8cf;">Download iPhone certificate profile</a></p>
+      <p>Transfer this public profile directly to your iPhone, for example using your own iCloud Drive. Open it on the iPhone, then install it in Settings &gt; General &gt; VPN &amp; Device Management.</p>
+      <p>Enable full trust for <strong>{{ ca_name }}</strong> in Settings &gt; General &gt; About &gt; Certificate Trust Settings. Verify this root's SHA-256 fingerprint before trusting it:</p>
+      <code style="display:block;overflow-wrap:anywhere;">{{ fingerprint }}</code>
+      <p>This adds a local certificate authority to your phone. Keep its private keys on this PC; remove its profile when you stop using the app. Do not bypass Safari certificate warnings.</p>
+    </details>
+    {% endif %}
+    <div id="approvalPanel" style="display:none;color:#fff;gap:8px;flex-direction:column;">
+      <strong>Approve your iPhone</strong>
+      <span id="approvalLabel" style="font-size:13px;"></span>
+      <span style="font-size:12px;">Approve only if you just entered this code on your phone.</span>
+      <button onclick="approveConnection(true, false)">Allow view only</button>
+      <button onclick="approveConnection(true, true)" class="primary">Allow view + mouse</button>
+      <button onclick="approveConnection(false, false)" class="danger">Deny</button>
     </div>
     <div id="codeDisplay" style="display:none; align-items:center; justify-content:center; gap:10px; padding:10px 0;">
       <span id="codeText" style="font-size:28px; letter-spacing:4px; font-family:monospace; color:#0f0;"></span>
@@ -219,9 +235,10 @@ HTML = """
     <button id="shareBtn" class="primary" onclick="startSharing()">Share Screen</button>
     <button id="viewBtn" onclick="viewScreen()">View Screen</button>
     <button id="disconnectBtn" class="danger" onclick="disconnect()" disabled>Disconnect</button>
+    <p style="color:#aaa;font-size:11px;line-height:1.5;">Each connection needs PC approval. Sessions end after 15 minutes without mouse activity or 60 minutes total.</p>
   </div>
 
-<script src="https://cdnjs.cloudflare.com/ajax/libs/socket.io/4.7.5/socket.io.min.js"></script>
+<script src="/static/vendor/socket.io.min.js"></script>
 <script>
 const hostCapability = {{ host_capability|tojson }};
 const socket = io({ auth: { host_capability: hostCapability } });
@@ -234,8 +251,11 @@ const codeInput = document.getElementById('codeInput');
 const codeDisplay = document.getElementById('codeDisplay');
 const codeText = document.getElementById('codeText');
 const newCodeBtn = document.getElementById('newCodeBtn');
-const rememberedList = document.getElementById('rememberedList');
-const rememberedLabel = document.getElementById('rememberedLabel');
+const approvalPanel = document.getElementById('approvalPanel');
+const approvalLabel = document.getElementById('approvalLabel');
+let pendingApproval = null;
+let canControl = false;
+try { localStorage.removeItem('mirrorMirrorDevice'); } catch (e) {}
 
 let pc = null;
 let localStream = null;
@@ -247,10 +267,6 @@ let reofferInProgress = false;
 
 if (!hostCapability || !navigator.mediaDevices || !navigator.mediaDevices.getDisplayMedia) {
   shareBtn.style.display = 'none';
-}
-
-if ('serviceWorker' in navigator) {
-  navigator.serviceWorker.register('/sw.js').catch(() => {});
 }
 
 function log(msg, color='#0f0') {
@@ -270,10 +286,7 @@ function closeMenu() {
 
 async function newPC() {
   const conn = new RTCPeerConnection({
-    iceServers: [
-      { urls: 'stun:stun.l.google.com:19302' },
-      { urls: 'stun:stun1.l.google.com:19302' }
-    ],
+    iceServers: [],
     iceCandidatePoolSize: 4
   });
   conn.onicecandidate = (e) => {
@@ -357,7 +370,7 @@ async function viewScreen() {
     role = 'viewer';
     shareBtn.disabled = true; viewBtn.disabled = true; disconnectBtn.disabled = false;
     pc = await newPC();
-    pc.ontrack = (event) => { video.srcObject = event.streams[0]; video.play().catch(() => {}); log('Streaming', '#0f0'); };
+    pc.ontrack = (event) => { video.srcObject = event.streams[0]; video.play().catch(() => {}); log(canControl ? 'Streaming -- mouse enabled' : 'Streaming -- view only', '#0f0'); };
     socket.emit('viewer_join_session', { code });
     setupTouchpad();
   } catch (e) {
@@ -366,47 +379,34 @@ async function viewScreen() {
   }
 }
 
-function renderRememberedDevice() {
-  const saved = localStorage.getItem('mirrorMirrorDevice');
-  if (!saved) {
-    rememberedList.style.display = 'none';
-    return;
-  }
-  const info = JSON.parse(saved);
-  rememberedLabel.textContent = 'Last connected ' + new Date(info.lastConnected).toLocaleString();
-  rememberedList.style.display = 'flex';
+function approveConnection(allow, control) {
+  if (!pendingApproval || !hostCapability || !sessionCode || !sessionToken) return;
+  socket.emit('approve_viewer', { room: sessionCode, token: sessionToken,
+    request_id: pendingApproval, allow, control });
+  pendingApproval = null;
+  approvalPanel.style.display = 'none';
 }
 
-async function reconnectToDevice() {
-  const saved = localStorage.getItem('mirrorMirrorDevice');
-  if (!saved) return;
-  const info = JSON.parse(saved);
-  role = 'viewer';
-  log('Reconnecting...', '#ff0');
-  pc = await newPC();
-  pc.ontrack = (event) => { video.srcObject = event.streams[0]; video.play().catch(() => {}); log('Streaming', '#0f0'); };
-  setupTouchpad();
-  socket.emit('quick_reconnect', { device_token: info.token });
-}
-
-function forgetDevice() {
-  const saved = localStorage.getItem('mirrorMirrorDevice');
-  if (saved) {
-    const info = JSON.parse(saved);
-    socket.emit('forget_device', { device_token: info.token });
-  }
-  localStorage.removeItem('mirrorMirrorDevice');
-  renderRememberedDevice();
-}
-
-socket.on('quick_reconnect_unavailable', () => {
-  if (pc) { pc.close(); pc = null; }
-  role = null;
-  log('Host isn\\'t sharing right now', '#f00');
+socket.on('pairing_request', (data) => {
+  if (role !== 'sharer' || data.room !== sessionCode) return;
+  pendingApproval = data.request_id;
+  approvalLabel.textContent = 'Device address: ' + data.ip;
+  approvalPanel.style.display = 'flex';
+  document.getElementById('menuPanel').classList.add('open');
+  document.getElementById('menuBackdrop').classList.add('open');
+  log('A phone is waiting for your approval', '#ff0');
 });
+socket.on('approval_cancelled', (data) => {
+  if (pendingApproval === data.request_id) {
+    pendingApproval = null;
+    approvalPanel.style.display = 'none';
+  }
+});
+socket.on('approval_pending', () => log('Waiting for approval on the PC', '#ff0'));
 
-function disconnect() {
-  if (sessionCode && sessionToken && role) {
+function disconnect(notify = true) {
+  if (notify && socket.connected && role === 'viewer' && !sessionCode) socket.emit('cancel_pairing');
+  if (notify && socket.connected && sessionCode && sessionToken && role) {
     socket.emit('leave_session', { room: sessionCode, token: sessionToken, role: role === 'sharer' ? 'host' : 'viewer' });
   }
   if (pc) { pc.close(); pc = null; }
@@ -416,7 +416,9 @@ function disconnect() {
   shareBtn.disabled = false; viewBtn.disabled = false; disconnectBtn.disabled = true;
   codeDisplay.style.display = 'none';
   sessionCode = null; sessionToken = null; role = null;
-  renderRememberedDevice();
+  canControl = false;
+  pendingApproval = null;
+  approvalPanel.style.display = 'none';
 }
 
 socket.on('session_created', (data) => {
@@ -430,17 +432,13 @@ socket.on('session_created', (data) => {
 socket.on('session_joined', (data) => {
   sessionCode = data.code;
   sessionToken = data.token;
-  if (data.device_token) {
-    localStorage.setItem('mirrorMirrorDevice', JSON.stringify({
-      token: data.device_token,
-      lastConnected: Date.now()
-    }));
-  }
+  canControl = data.control === true;
   log('Paired -- waiting for video...', '#ff0');
   closeMenu();
 });
 
 socket.on('pairing_error', (data) => {
+  disconnect(false);
   log('Pairing failed: ' + data.message, '#f00');
   shareBtn.disabled = false; viewBtn.disabled = false; disconnectBtn.disabled = true;
 });
@@ -461,15 +459,7 @@ socket.on('peer_joined', async (data) => {
     await createAndSendOffer();
   }
 });
-socket.on('peer_left', () => { log('Other side disconnected', '#f00'); disconnect(); });
-
-socket.on('viewer_disconnected', () => {
-  if (role !== 'sharer') return;
-  if (pc) { pc.close(); pc = null; }
-  log('Viewer disconnected -- waiting to reconnect...', '#ff0');
-});
-
-socket.on('rejoined', () => { log('Reconnected -- restoring video...', '#ff0'); });
+socket.on('peer_left', (data) => { disconnect(false); log(data.message || 'Session ended', '#f00'); });
 
 async function reofferFromHost() {
   if (role !== 'sharer' || !localStream || reofferInProgress) return;
@@ -491,7 +481,7 @@ socket.on('offer', async (data) => {
   try {
     if (pc) { pc.close(); }
     pc = await newPC();
-    pc.ontrack = (event) => { video.srcObject = event.streams[0]; video.play().catch(() => {}); log('Streaming', '#0f0'); };
+    pc.ontrack = (event) => { video.srcObject = event.streams[0]; video.play().catch(() => {}); log(canControl ? 'Streaming -- mouse enabled' : 'Streaming -- view only', '#0f0'); };
     await pc.setRemoteDescription(new RTCSessionDescription(data));
     const answer = await pc.createAnswer();
     await pc.setLocalDescription(answer);
@@ -509,20 +499,13 @@ socket.on('ice_candidate', async (data) => {
 });
 
 socket.on('connect', () => {
-  if (sessionCode && sessionToken && role) {
-    log('Reconnecting...', '#ff0');
-    socket.emit('rejoin_session', { code: sessionCode, token: sessionToken, role: role === 'sharer' ? 'host' : 'viewer' });
-  } else {
-    log('Connected -- pick a role', '#0f0');
-    renderRememberedDevice();
-    if (localStorage.getItem('mirrorMirrorDevice')) {
-      toggleMenu();
-    }
-  }
+  log(hostCapability ? 'Ready -- share your screen, then approve your phone' : 'Connected securely -- enter the PC code', '#0f0');
 });
 socket.on('disconnect', () => {
-  log('Connection lost, retrying...', '#f00');
+  disconnect(false);
+  log('Connection lost -- a new code and PC approval are required', '#f00');
 });
+socket.on('connect_error', () => log('Connection rejected -- use the HTTPS phone address', '#f00'));
 
 document.addEventListener('visibilitychange', () => {
   if (document.visibilityState !== 'visible' || role !== 'viewer' || !video.srcObject) return;
@@ -545,6 +528,7 @@ function setupTouchpad() {
 
 function onTouchStart(e) {
   e.preventDefault();
+  if (!canControl) return;
   const touches = e.touches;
   touchState = {
     fingers: touches.length,
@@ -556,7 +540,7 @@ function onTouchStart(e) {
 
 function onTouchMove(e) {
   e.preventDefault();
-  if (!touchState) return;
+  if (!canControl || !touchState) return;
   const t = e.touches[0];
   const dx = (t.clientX - touchState.lastX) * SENSITIVITY;
   const dy = (t.clientY - touchState.lastY) * SENSITIVITY;
@@ -573,7 +557,7 @@ function onTouchMove(e) {
 
 function onTouchEnd(e) {
   e.preventDefault();
-  if (!touchState) return;
+  if (!canControl || !touchState) return;
   const elapsed = Date.now() - touchState.startTime;
   if (!touchState.moved && elapsed < 300) {
     if (touchState.fingers >= 2) socket.emit('mouse_click', { room: sessionCode, token: sessionToken, button: 'right' });
@@ -589,11 +573,48 @@ function onTouchEnd(e) {
 
 @app.route('/')
 def index():
+    identity = app.config.get('TLS_IDENTITY', {})
     response = app.make_response(render_template_string(
-        HTML, host_capability=_host_capability if _local_host_request() else None))
+        HTML, host_capability=_host_capability if _local_host_request() else None,
+        lan_url=app.config.get('LAN_URL', ''), ca_name=identity.get('name', ''),
+        fingerprint=identity.get('fingerprint', '')))
     response.headers['Cache-Control'] = 'no-store'
     response.headers['X-Frame-Options'] = 'DENY'
     response.headers['Content-Security-Policy'] = "frame-ancestors 'none'"
+    return response
+
+
+@app.before_request
+def require_secure_transport():
+    # The only HTTP listener binds to loopback, and the same check is enforced
+    # here and at Socket.IO connection time as defense in depth.
+    if not request.is_secure and not _local_host_request():
+        abort(403)
+
+
+@app.after_request
+def security_headers(response):
+    response.headers['X-Content-Type-Options'] = 'nosniff'
+    response.headers['Referrer-Policy'] = 'no-referrer'
+    response.headers['X-Frame-Options'] = 'DENY'
+    response.headers['Content-Security-Policy'] = (
+        "default-src 'self'; script-src 'self' 'unsafe-inline'; "
+        "style-src 'self' 'unsafe-inline'; media-src 'self' blob:; "
+        "connect-src 'self' ws: wss:; frame-ancestors 'none'; "
+        "base-uri 'none'; object-src 'none'")
+    return response
+
+
+@app.route('/setup/iphone-profile')
+def iphone_profile():
+    if not _local_host_request():
+        abort(403)
+    identity = app.config.get('TLS_IDENTITY')
+    if not identity:
+        abort(503)
+    response = Response(identity['profile'], mimetype='application/x-apple-aspen-config')
+    response.headers['Content-Disposition'] = 'attachment; filename="MirrorMirror-iPhone.mobileconfig"'
+    response.headers['Cache-Control'] = 'no-store'
     return response
 
 
@@ -621,285 +642,269 @@ def icon():
 tray_status = {"code": None, "connected": False}
 
 
+def _end_session(code, message='Session ended; start sharing again'):
+    s = sessions.pop(code, None)
+    if not s:
+        return
+    for sid in {s.get('host_sid'), s.get('viewer_sid'), s.get('pending', {}).get('sid')} - {None}:
+        socketio.emit('peer_left', {'message': message}, to=sid)
+        socketio.server.leave_room(sid, code, namespace='/')
+    tray_status.update(code=None, connected=False)
+
+
+def _cancel_pending(s, message):
+    pending = s.pop('pending', None)
+    if pending:
+        socketio.emit('pairing_error', {'message': message}, to=pending['sid'])
+        socketio.emit('approval_cancelled', {'request_id': pending['id']}, to=s['host_sid'])
+
+
 @socketio.on('host_create_session')
+@_locked
 def handle_host_create_session():
     if request.sid not in _host_sids:
         emit('pairing_error', {'message': 'Start sharing from http://localhost:5000 on the PC'})
         return
+    # One share at a time; a fresh host share revokes every previous approval.
+    for old_code in list(sessions):
+        _end_session(old_code)
     code = _new_code()
     host_token = secrets.token_hex(32)
     sessions[code] = {
-        'host_sid': request.sid,
-        'viewer_sid': None,
-        'host_token': host_token,
-        'token': secrets.token_hex(32),
-        'created_at': time.time(),
-        'claimed': False,
+        'host_sid': request.sid, 'viewer_sid': None,
+        'host_token': host_token, 'token': secrets.token_hex(32),
+        'created_at': time.monotonic(), 'claimed': False, 'control': False,
     }
     join_room(code)
-    tray_status["code"] = code
-    tray_status["connected"] = False
+    tray_status.update(code=code, connected=False)
     emit('session_created', {'code': code, 'token': host_token})
 
 
 @socketio.on('refresh_code')
+@_locked
 def handle_refresh_code(data):
-    old_code, token = data.get('room'), data.get('token')
-    s = sessions.get(old_code)
-    if not _authorized(old_code, token, request.sid, 'host'):
+    code, token = data.get('room'), data.get('token')
+    if not _authorized(code, token, request.sid, 'host'):
         return
-    if s['claimed'] and s.get('viewer_sid'):
-        emit('code_refreshed', room=s['viewer_sid'])
-        leave_room(old_code, sid=s['viewer_sid'])
-    leave_room(old_code)
-    new_code = _new_code()
-    new_token = secrets.token_hex(32)
-    sessions[new_code] = {
-        'host_sid': request.sid,
-        'viewer_sid': None,
-        'host_token': new_token,
-        'token': secrets.token_hex(32),
-        'created_at': time.time(),
-        'claimed': False,
-    }
-    del sessions[old_code]
-    join_room(new_code)
-    tray_status["code"] = new_code
-    tray_status["connected"] = False
-    emit('session_created', {'code': new_code, 'token': new_token})
-
-
-def _complete_pairing(code, s, sid, existing_device_token=None):
-    if s.get('host_sid') not in _host_sids or s.get('viewer_sid'):
-        emit('pairing_error', {'message': 'Host unavailable or viewer already connected'})
-        return
-    s['claimed'] = True
-    s['viewer_sid'] = sid
-    s['token'] = secrets.token_hex(32)
-    join_room(code)
-    tray_status["connected"] = True
-
-    if existing_device_token and existing_device_token in trusted_devices:
-        device_token = existing_device_token
-    else:
-        device_token = secrets.token_hex(16)
-        trusted_devices[device_token] = {'added_at': time.time()}
-        _save_trusted_devices()
-
-    s['device_token'] = device_token
-    emit('session_joined', {'code': code, 'token': s['token'], 'device_token': device_token})
-    emit('peer_joined', {'role': 'viewer'}, room=s['host_sid'])
+    s = sessions.pop(code)
+    _cancel_pending(s, 'Pairing code changed')
+    if s.get('viewer_sid'):
+        emit('code_refreshed', to=s['viewer_sid'])
+        leave_room(code, sid=s['viewer_sid'])
+    leave_room(code)
+    handle_host_create_session()
 
 
 @socketio.on('viewer_join_session')
+@_locked
 def handle_viewer_join_session(data):
     ip = request.remote_addr
     if _rate_limited(ip):
-        emit('pairing_error', {'message': 'Too many attempts, try again later'})
+        emit('pairing_error', {'message': 'Too many attempts; try again later'})
         return
-    code = (data.get('code') or '').strip()
+    _record_failed_attempt(ip)  # Bound valid-code prompt spam as well as guesses.
+    code = data.get('code')
     s = _session_for(code)
-    if not s:
-        _record_failed_attempt(ip)
-        emit('pairing_error', {'message': 'Invalid or expired code'})
+    if (not s or s['claimed'] or s.get('host_sid') not in _host_sids
+            or not request.is_secure):
+        emit('pairing_error', {'message': 'Invalid, unavailable, or expired code; use HTTPS'})
         return
-    if s['claimed']:
-        _record_failed_attempt(ip)
-        emit('pairing_error', {'message': 'Code already used'})
+    if s.get('pending'):
+        if time.monotonic() - s['pending']['created_at'] <= APPROVAL_TTL:
+            emit('pairing_error', {'message': 'A connection is already awaiting PC approval'})
+            return
+        _cancel_pending(s, 'Approval timed out')
+    pending = {'sid': request.sid, 'id': secrets.token_hex(16),
+               'created_at': time.monotonic(), 'ip': ip}
+    s['pending'] = pending
+    emit('approval_pending')
+    emit('pairing_request', {'room': code, 'request_id': pending['id'], 'ip': ip}, to=s['host_sid'])
+
+
+@socketio.on('approve_viewer')
+@_locked
+def handle_approve_viewer(data):
+    code = data.get('room')
+    if not _authorized(code, data.get('token'), request.sid, 'host'):
         return
-    _complete_pairing(code, s, request.sid)
+    s = sessions[code]
+    pending = s.get('pending')
+    if not pending or pending['id'] != data.get('request_id'):
+        return
+    if (time.monotonic() - pending['created_at'] > APPROVAL_TTL
+            or pending['sid'] not in _connected_sids):
+        _cancel_pending(s, 'Approval timed out; pair again')
+        return
+    if data.get('allow') is not True:
+        _cancel_pending(s, 'Connection denied on the PC')
+        return
+    s.pop('pending')
+    s.update(claimed=True, viewer_sid=pending['sid'], token=secrets.token_hex(32),
+             control=data.get('control') is True, approved_at=time.monotonic(),
+             last_activity=time.monotonic())
+    join_room(code, sid=pending['sid'])
+    tray_status['connected'] = True
+    emit('session_joined', {'code': code, 'token': s['token'], 'control': s['control']}, to=pending['sid'])
+    emit('peer_joined', {'role': 'viewer', 'control': s['control']}, to=s['host_sid'])
 
 
 @socketio.on('quick_reconnect')
+@_locked
 def handle_quick_reconnect(data):
-    device_token = data.get('device_token')
-    if not device_token or device_token not in trusted_devices:
-        emit('quick_reconnect_unavailable')
-        return
-
-    for code, s in sessions.items():
-        if (s.get('device_token') == device_token
-                and s.get('host_sid') in _host_sids and not s.get('viewer_sid')):
-            _complete_pairing(code, s, request.sid, existing_device_token=device_token)
-            return
-
-    waiting_code = None
-    for code in list(sessions):
-        s = _session_for(code)
-        if s and not s['claimed'] and s.get('host_sid') in _host_sids:
-            waiting_code = code
-            break
-    if not waiting_code:
-        emit('quick_reconnect_unavailable')
-        return
-    _complete_pairing(waiting_code, sessions[waiting_code], request.sid, existing_device_token=device_token)
+    # Old on-disk remembered credentials are deliberately never loaded.
+    emit('quick_reconnect_unavailable')
 
 
-@socketio.on('leave_session')
-def handle_leave_session(data):
-    code, token, role = data.get('room'), data.get('token'), data.get('role')
-    s = sessions.get(code)
-    if not _authorized(code, token, request.sid, role):
-        return
-    if role == 'host' and s.get('host_sid') == request.sid:
-        if s.get('viewer_sid'):
-            emit('peer_left', room=s['viewer_sid'])
-            leave_room(code, sid=s['viewer_sid'])
-        leave_room(code)
-        sessions.pop(code, None)
-        tray_status["code"] = None
-        tray_status["connected"] = False
-    elif role == 'viewer' and s.get('viewer_sid') == request.sid:
-        leave_room(code)
-        s['viewer_sid'] = None
-        s['viewer_disconnected_at'] = time.time()
-        tray_status["connected"] = False
-        if s.get('host_sid'):
-            emit('viewer_disconnected', room=s['host_sid'])
-
-
-@socketio.on('forget_device')
-def handle_forget_device(data):
-    device_token = data.get('device_token')
-    if device_token in trusted_devices:
-        del trusted_devices[device_token]
-        _save_trusted_devices()
-
-
-@socketio.on('disconnect')
-def handle_disconnect():
-    _host_sids.discard(request.sid)
-    for code, s in list(sessions.items()):
-        if s['host_sid'] == request.sid:
-            s['host_sid'] = None
-            s['host_disconnected_at'] = time.time()
-            tray_status["connected"] = False
-        elif s['viewer_sid'] == request.sid:
-            s['viewer_sid'] = None
-            s['viewer_disconnected_at'] = time.time()
-            tray_status["connected"] = False
-            if s.get('host_sid'):
-                emit('viewer_disconnected', room=s['host_sid'])
+@socketio.on('cancel_pairing')
+@_locked
+def handle_cancel_pairing(data):
+    for s in sessions.values():
+        if s.get('pending', {}).get('sid') == request.sid:
+            _cancel_pending(s, 'Pairing cancelled')
 
 
 @socketio.on('rejoin_session')
+@_locked
 def handle_rejoin_session(data):
-    code, token, role = data.get('code'), data.get('token'), data.get('role')
-    s = sessions.get(code)
-    token_key = 'host_token' if role == 'host' else 'token'
-    if (not s or role not in {'host', 'viewer'} or s.get(token_key) != token
-            or (role == 'host' and request.sid not in _host_sids)
-            or (role == 'viewer' and (not s['claimed']
-                                     or s.get('host_sid') not in _host_sids))
-            or s.get(role + '_sid') not in (None, request.sid)):
-        emit('pairing_error', {'message': 'Session expired, please reconnect'})
-        return
-    if role == 'host':
-        s['host_sid'] = request.sid
-        s.pop('host_disconnected_at', None)
-    else:
-        s['viewer_sid'] = request.sid
-        s.pop('viewer_disconnected_at', None)
-    join_room(code)
-    tray_status["connected"] = bool(s.get('host_sid') and s.get('viewer_sid'))
-    emit('rejoined', {'code': code})
-    if s.get('host_sid') and s.get('viewer_sid'):
-        emit('please_reoffer', room=s['host_sid'])
+    emit('pairing_error', {'message': 'Reconnections require a new code and PC approval'})
+
+
+@socketio.on('leave_session')
+@_locked
+def handle_leave_session(data):
+    code = data.get('room')
+    if _authorized(code, data.get('token'), request.sid, data.get('role')):
+        _end_session(code)
+
+
+@socketio.on('disconnect')
+def handle_disconnect(reason=None):
+    with _session_lock:
+        _host_sids.discard(request.sid)
+        _connected_sids.discard(request.sid)
+        for code, s in list(sessions.items()):
+            if request.sid in (s.get('host_sid'), s.get('viewer_sid')):
+                _end_session(code)
+            elif s.get('pending', {}).get('sid') == request.sid:
+                _cancel_pending(s, 'Viewer disconnected')
+
+
+def _expire_sessions():
+    with _session_lock:
+        for code in list(sessions):
+            s = _session_for(code)
+            if s and s.get('pending') and time.monotonic() - s['pending']['created_at'] > APPROVAL_TTL:
+                _cancel_pending(s, 'Approval timed out; pair again')
 
 
 def _sweep_expired_sessions():
     while True:
-        socketio.sleep(15)
-        now = time.time()
-        for code, s in list(sessions.items()):
-            host_gone = s['host_sid'] is None and now - s.get('host_disconnected_at', now) > DISCONNECT_GRACE
-            if host_gone:
-                if s.get('viewer_sid'):
-                    socketio.emit('peer_left', room=s['viewer_sid'], namespace='/')
-                del sessions[code]
-                tray_status["code"] = None
-                tray_status["connected"] = False
-                continue
-
-            viewer_gone = (
-                s['viewer_sid'] is None and s['claimed']
-                and now - s.get('viewer_disconnected_at', now) > VIEWER_RECONNECT_GRACE
-            )
-            if viewer_gone:
-                if s.get('host_sid'):
-                    socketio.emit('peer_left', room=s['host_sid'], namespace='/')
-                del sessions[code]
-                tray_status["code"] = None
-                tray_status["connected"] = False
+        socketio.sleep(5)
+        _expire_sessions()
 
 
 @socketio.on('offer')
+@_locked
 def handle_offer(data):
-    code, token = data.get('room'), data.get('token')
-    if not _authorized(code, token, request.sid, 'host'):
+    code = data.get('room')
+    if not _authorized(code, data.get('token'), request.sid, 'host'):
         return
-    # Do not forward the host's credential to the viewer.
     peer = sessions[code].get('viewer_sid')
-    if peer:
-        emit('offer', {'sdp': data.get('sdp'), 'type': data.get('type')}, room=peer)
+    if peer and isinstance(data.get('sdp'), str) and data.get('type') == 'offer':
+        emit('offer', {'sdp': data['sdp'], 'type': 'offer'}, to=peer)
 
 
 @socketio.on('answer')
+@_locked
 def handle_answer(data):
-    code, token = data.get('room'), data.get('token')
-    if not _authorized(code, token, request.sid, 'viewer'):
+    code = data.get('room')
+    if not _authorized(code, data.get('token'), request.sid, 'viewer'):
         return
-    emit('answer', {'sdp': data.get('sdp'), 'type': data.get('type')}, room=sessions[code]['host_sid'])
+    if isinstance(data.get('sdp'), str) and data.get('type') == 'answer':
+        emit('answer', {'sdp': data['sdp'], 'type': 'answer'}, to=sessions[code]['host_sid'])
 
 
 @socketio.on('ice_candidate')
+@_locked
 def handle_ice_candidate(data):
     code, token = data.get('room'), data.get('token')
-    s = sessions.get(code)
     is_host = _authorized(code, token, request.sid, 'host')
     if not is_host and not _authorized(code, token, request.sid, 'viewer'):
         return
+    s = sessions[code]
     peer = s.get('viewer_sid') if is_host else s.get('host_sid')
-    if peer:
-        emit('ice_candidate', {'candidate': data.get('candidate')}, room=peer)
+    if peer and isinstance(data.get('candidate'), dict):
+        emit('ice_candidate', {'candidate': data['candidate']}, to=peer)
+
+
+def _control_session(data):
+    code = data.get('room')
+    if not HAVE_PYAUTOGUI or not _authorized(code, data.get('token'), request.sid, 'viewer'):
+        return None
+    s = sessions[code]
+    return s if s.get('control') else None
+
+
+def _number(value, limit):
+    return type(value) in (int, float) and abs(value) <= limit and math.isfinite(value)
+
+
+def _mouse_call(s, method, *args, **kwargs):
+    try:
+        method(*args, _pause=False, **kwargs)
+        s['last_activity'] = time.monotonic()
+    except pyautogui.FailSafeException:
+        _end_session(next(code for code, session in sessions.items() if session is s),
+                     'Mouse fail-safe triggered; session ended')
 
 
 @socketio.on('mouse_move')
+@_locked
 def handle_mouse_move(data):
-    if not HAVE_PYAUTOGUI:
-        return
-    code, token = data.get('room'), data.get('token')
-    if not _authorized(code, token, request.sid, 'viewer'):
-        return
+    s = _control_session(data)
     dx, dy = data.get('dx', 0), data.get('dy', 0)
-    pyautogui.moveRel(dx, dy, duration=0, _pause=False)
+    if s and _number(dx, 1000) and _number(dy, 1000):
+        _mouse_call(s, pyautogui.moveRel, dx, dy, duration=0)
 
 
 @socketio.on('mouse_click')
+@_locked
 def handle_mouse_click(data):
-    if not HAVE_PYAUTOGUI:
-        return
-    code, token = data.get('room'), data.get('token')
-    if not _authorized(code, token, request.sid, 'viewer'):
-        return
-    pyautogui.click(button=data.get('button', 'left'), _pause=False)
+    s = _control_session(data)
+    button = data.get('button', 'left')
+    if s and button in ('left', 'right'):
+        _mouse_call(s, pyautogui.click, button=button)
 
 
 @socketio.on('mouse_scroll')
+@_locked
 def handle_mouse_scroll(data):
-    if not HAVE_PYAUTOGUI:
-        return
-    code, token = data.get('room'), data.get('token')
-    if not _authorized(code, token, request.sid, 'viewer'):
-        return
-    pyautogui.scroll(int(-data.get('dy', 0) * 2), _pause=False)
+    s = _control_session(data)
+    dy = data.get('dy', 0)
+    if s and _number(dy, 100):
+        _mouse_call(s, pyautogui.scroll, int(-dy * 2))
+
+
+def create_servers(lan_ip, local_port=5000, secure_port=5443):
+    """Bind both listeners before launching; never fall back to LAN HTTP."""
+    from tls_setup import prepare_tls
+    from werkzeug.serving import make_server
+    identity = prepare_tls(_data_dir, lan_ip)
+    app.config['TLS_IDENTITY'] = identity
+    local = make_server('127.0.0.1', local_port, app, threaded=True)
+    try:
+        secure = make_server('0.0.0.0', secure_port, app, threaded=True, ssl_context=identity['context'])
+    except BaseException:
+        local.server_close()
+        raise
+    app.config['LAN_URL'] = f'https://{lan_ip}:{secure.server_port}'
+    return local, secure
 
 
 if __name__ == '__main__':
     import io
     import socket
     import sys
-    import threading
     import webbrowser
     import pystray
     from PIL import Image
@@ -910,127 +915,79 @@ if __name__ == '__main__':
         sys.stderr = open(os.devnull, 'w')
 
     def get_lan_ip():
-        s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-        try:
-            s.connect(('8.8.8.8', 80))
-            return s.getsockname()[0]
-        except Exception:
-            return '127.0.0.1'
-        finally:
-            s.close()
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as probe:
+            # UDP connect selects the route; it does not send a packet.
+            probe.connect(('192.0.2.1', 9))
+            return probe.getsockname()[0]
 
-    LAN_IP = get_lan_ip()
-    LAN_URL = f"http://{LAN_IP}:5000"
+    try:
+        LAN_IP = get_lan_ip()
+        local_server, tls_server = create_servers(LAN_IP)
+    except Exception as error:
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showerror('Mirror Mirror could not start securely', str(error))
+        root.destroy()
+        raise SystemExit(1)
 
-    def run_server():
-        socketio.run(app, host='0.0.0.0', port=5000, debug=False, use_reloader=False, allow_unsafe_werkzeug=True)
-
-    UPDATE_CHECK_INTERVAL = 6 * 60 * 60
-    update_status = {"available": False, "version": None, "url": f"https://github.com/{UPDATE_REPO}/releases/latest"}
-
-    def _parse_version(v):
-        v = (v or "").strip().lstrip("vV")
-        try:
-            return tuple(int(p) for p in v.split("."))
-        except ValueError:
-            return None
-
-    def _check_for_update():
-        import urllib.request
-        try:
-            req = urllib.request.Request(
-                f"https://api.github.com/repos/{UPDATE_REPO}/releases/latest",
-                headers={"Accept": "application/vnd.github+json", "User-Agent": "MirrorMirror-UpdateCheck"},
-            )
-            with urllib.request.urlopen(req, timeout=10) as resp:
-                data = json.load(resp)
-            latest_tag = data.get("tag_name", "")
-            latest = _parse_version(latest_tag)
-            current = _parse_version(APP_VERSION)
-            if not latest or not current or latest <= current:
-                return
-            already_notified = update_status["available"] and update_status["version"] == latest_tag
-            update_status["available"] = True
-            update_status["version"] = latest_tag
-            update_status["url"] = data.get("html_url") or update_status["url"]
-            if not already_notified:
-                tray_icon.notify(
-                    f"Version {latest_tag} is available (you're on {APP_VERSION}). "
-                    "Click the tray icon to download it.",
-                    "Mirror Mirror update available",
-                )
-        except Exception as e:
-            print(f"[warn] update check failed: {e}")
-
-    def _update_check_loop():
-        time.sleep(5)
-        while True:
-            _check_for_update()
-            time.sleep(UPDATE_CHECK_INTERVAL)
+    LAN_URL = app.config['LAN_URL']
 
     def status_label(item):
-        if tray_status["connected"]:
-            return "Status: Connected"
-        if tray_status["code"]:
-            return f"Code: {tray_status['code']}"
-        return "Status: Idle"
+        if tray_status['connected']:
+            return 'Status: Connected (PC approved)'
+        return f"Code: {tray_status['code']}" if tray_status['code'] else 'Status: Idle'
 
     def address_label(item):
-        return f"On phone, go to: {LAN_URL}"
+        return f'On iPhone: {LAN_URL}'
 
     def copy_address(icon, item):
-        try:
-            import pyperclip
-            pyperclip.copy(LAN_URL)
-            icon.notify(f"Copied {LAN_URL} to clipboard", "Mirror Mirror")
-        except Exception:
-            pass
+        import pyperclip
+        pyperclip.copy(LAN_URL)
+        icon.notify(f'Copied {LAN_URL}', 'Mirror Mirror')
 
     def open_app(icon, item):
-        webbrowser.open("http://localhost:5000")
+        webbrowser.open('http://localhost:5000')
 
-    def update_label(item):
-        if update_status["available"]:
-            return f"Update available: {update_status['version']} (click)"
-        return f"Version {APP_VERSION}"
-
-    def open_update(icon, item):
-        if update_status["available"]:
-            webbrowser.open(update_status["url"])
+    def stop_sharing(icon, item):
+        with _session_lock:
+            for code in list(sessions):
+                _end_session(code, 'Stopped from the PC tray menu')
 
     def quit_app(icon, item):
+        stop_sharing(icon, item)
         icon.stop()
-        import os
+        local_server.shutdown()
+        tls_server.shutdown()
         os._exit(0)
 
     icon_image = Image.open(io.BytesIO(base64.b64decode(ICON_B64)))
-    menu = pystray.Menu(
+    tray_icon = pystray.Icon('MirrorMirror', icon_image, 'Mirror Mirror hardened', pystray.Menu(
         pystray.MenuItem(status_label, None, enabled=False),
         pystray.MenuItem(address_label, copy_address),
-        pystray.MenuItem(update_label, open_update),
-        pystray.MenuItem("Open Mirror Mirror", open_app, default=True),
-        pystray.MenuItem("Quit", quit_app),
-    )
-    tray_icon = pystray.Icon("MirrorMirror", icon_image, "Mirror Mirror", menu)
+        pystray.MenuItem(f'Version {APP_VERSION}', None, enabled=False),
+        pystray.MenuItem('Open Mirror Mirror / iPhone setup', open_app, default=True),
+        pystray.MenuItem('Stop sharing now', stop_sharing),
+        pystray.MenuItem('Quit', quit_app),
+    ))
 
-    def _show_welcome_popup():
-        try:
-            import tkinter as tk
-            from tkinter import messagebox
-            _root = tk.Tk()
-            _root.withdraw()
-            messagebox.showinfo(
-                "Mirror Mirror",
-                "Mirror Mirror is now running in the system tray.\n\n"
-                "Right-click the tray icon to see your pairing code or address, "
-                "or left-click to open the app."
-            )
-            _root.destroy()
-        except Exception:
-            pass
+    def show_welcome():
+        import tkinter as tk
+        from tkinter import messagebox
+        root = tk.Tk()
+        root.withdraw()
+        messagebox.showinfo('Mirror Mirror',
+            'Mirror Mirror is running in the system tray.\n\n'
+            'On the PC: http://localhost:5000\n'
+            f'On your iPhone: {LAN_URL}\n\n'
+            'Open the PC page for one-time iPhone certificate setup. '
+            'Every phone connection requires approval on the PC.')
+        root.destroy()
 
     socketio.start_background_task(_sweep_expired_sessions)
-    threading.Thread(target=run_server, daemon=True).start()
-    threading.Thread(target=_update_check_loop, daemon=True).start()
-    threading.Thread(target=_show_welcome_popup, daemon=True).start()
+    threading.Thread(target=local_server.serve_forever, daemon=True).start()
+    threading.Thread(target=tls_server.serve_forever, daemon=True).start()
+    if '--no-welcome' not in sys.argv:
+        threading.Thread(target=show_welcome, daemon=True).start()
     tray_icon.run()

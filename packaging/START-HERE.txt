@@ -1,0 +1,46 @@
+Mirror Mirror hardened - portable Windows x64
+
+Extract the ZIP and run MirrorMirrorHardened.exe. No Python installation needed.
+The unsigned executable runs as your normal Windows user.
+
+PC: open http://localhost:5000 in Chrome or Edge.
+iPhone: use the HTTPS address displayed in the PC page or tray menu (port 5443).
+Your phone and PC must be on the same trusted Wi-Fi. Restrict the Windows firewall
+exception to Private networks and your viewing device; never port-forward 5443.
+Port 5000 listens only on the PC itself.
+
+ONE-TIME IPHONE SETUP:
+The PC page has an iPhone HTTPS setup section. Download the public certificate
+profile there and transfer it directly to your iPhone using a trusted method,
+such as your own iCloud Drive or a cable. Open it on the phone, install it under
+Settings > General > VPN & Device Management, then enable full trust for the
+matching Mirror Mirror Local certificate under General > About > Certificate
+Trust Settings. Check the certificate name/fingerprint against the PC page.
+This adds a local certificate authority to your phone; remove its profile when
+you stop using this app. Never bypass Safari certificate warnings. See README.md.
+No certificate is automatically installed on either device.
+
+SHARING:
+1. On the PC page, click Share Screen and select the screen/window.
+2. On the phone, open the displayed HTTPS address in Safari and enter the code.
+3. Back on the PC, choose Allow view only, Allow view + mouse, or Deny.
+4. Disconnects revoke approval. To reconnect, start sharing again with a new code.
+5. Sessions expire after 15 minutes without mouse activity or 60 minutes total.
+6. Use Disconnect or tray menu > Stop sharing now / Quit when finished.
+
+SAFARI MOUSE CONTROLS (only after PC approval of mouse control):
+One-finger drag moves the pointer; tap left-clicks; two-finger tap right-clicks;
+two-finger drag scrolls. Keyboard input and click-and-drag are not implemented.
+Moving the real PC pointer into a corner activates the mouse fail-safe and ends
+the session when the next remote mouse command arrives. The tray stop action
+revokes access immediately.
+
+Private TLS keys are generated separately on your PC, protected for your Windows
+account and SYSTEM, and are never included in this ZIP or served to the phone.
+Do not share files from %LOCALAPPDATA%\MirrorMirror\tls. Only the public profile
+downloaded from the PC page is intended for transfer. A changed PC IP address
+requires restarting the app; the root certificate normally stays the same.
+
+Security tests and packaged startup checks do not constitute a full security
+audit or a guarantee against compromise. Live iPhone screen sharing has not been
+verified on your device. Source: https://github.com/rigelramadhan/Mirror-Mirror

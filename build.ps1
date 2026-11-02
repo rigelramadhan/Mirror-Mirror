@@ -3,10 +3,12 @@ $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 Push-Location $PSScriptRoot
 try {
+    $iconPath = Join-Path $PSScriptRoot 'mirror_mirror.ico'
+    $staticPath = Join-Path $PSScriptRoot 'static'
     & $Python -m PyInstaller --noconfirm --clean --onefile --windowed `
-        --name MirrorMirrorHardened --icon mirror_mirror.ico `
+        --name MirrorMirrorHardened --icon $iconPath `
         --distpath dist/hardened --workpath build/hardened --specpath build/hardened `
-        --add-data 'static;static' `
+        --add-data "$staticPath;static" `
         --hidden-import engineio.async_drivers.threading --hidden-import pystray._win32 `
         webrtc_browser.py
     if ($LASTEXITCODE -ne 0) { throw 'Executable build failed' }

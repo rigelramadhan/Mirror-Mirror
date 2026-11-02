@@ -8,9 +8,19 @@ Built this because Chrome Remote Desktop is discontinued, RDP shadowing doesn't 
 
 ## Install
 
-Grab the latest installer from [Releases](../../releases), run it, done. No admin rights needed, it installs to your user folder and adds a Start Menu entry.
+This fork currently provides the access-control fix as source code. No patched
+installer has been published. To run it on Windows with Python installed:
 
-The first time it launches, Windows will ask whether to allow it through the firewall. Click **Allow**, or nothing on your network will be able to reach it.
+```powershell
+git clone https://github.com/rigelramadhan/Mirror-Mirror.git
+cd Mirror-Mirror
+py -m venv .venv
+.\.venv\Scripts\python.exe -m pip install -r requirements.txt
+.\.venv\Scripts\python.exe webrtc_browser.py
+```
+
+Windows may ask whether to allow it through the firewall. Allow access only on a
+trusted private network and restrict inbound access to your viewing devices.
 
 ## Support
 

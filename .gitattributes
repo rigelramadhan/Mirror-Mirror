@@ -1,0 +1,2 @@
+# Preserve the upstream npm bundle byte-for-byte, including on Windows checkouts.
+/static/vendor/socket.io.min.js -text
